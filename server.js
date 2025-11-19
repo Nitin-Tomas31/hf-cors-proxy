@@ -9,52 +9,84 @@ const server = http.createServer((req, res) => {
   const parsed = url.parse(req.url, true);
   const target = parsed.query.url;
 
-  // Always send CORS headers
+  // --- 1. CORS Headers ---
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
+  res.setHeader("Access-Control-Allow-Headers", req.headers["access-control-request-headers"] || "Content-Type, Authorization"); // Use request headers for preflight
 
-  // Handle preflight
+  // --- 2. Handle Preflight ---
   if (req.method === "OPTIONS") {
     res.writeHead(204);
     return res.end();
   }
 
-  // If no ?url, show error
+  // --- 3. Validate Target URL ---
   if (!target) {
     res.writeHead(400, { "Content-Type": "application/json" });
-    return res.end(JSON.stringify({ error: "Missing ?url=" }));
+    return res.end(JSON.stringify({ error: "Missing ?url= parameter." }));
   }
 
-  // Proxy request to HuggingFace
-  const targetURL = new URL(target);
+  // --- 4. Proxy Request Logic ---
+  let targetURL;
+  try {
+    targetURL = new URL(target);
+  } catch (e) {
+    res.writeHead(400, { "Content-Type": "application/json" });
+    return res.end(JSON.stringify({ error: "Invalid target URL provided." }));
+  }
+  
   const lib = targetURL.protocol === "https:" ? https : http;
+
+  // Clone all incoming headers and make necessary modifications
+  const proxyHeaders = { ...req.headers };
+  
+  // *** CRITICAL FIX: Overwrite the Host header for the target server ***
+  proxyHeaders['host'] = targetURL.host; 
+  
+  // Remove headers that are handled automatically or should be regenerated
+  delete proxyHeaders['connection'];
+  delete proxyHeaders['host']; // Already using the target URL host
+
+  // Remove CORS-related headers sent by the client (they confuse the target)
+  delete proxyHeaders['origin'];
+  delete proxyHeaders['access-control-request-method'];
+  delete proxyHeaders['access-control-request-headers'];
 
   const proxyReq = lib.request(
     targetURL,
     {
       method: req.method,
-      headers: {
-        "Content-Type": req.headers["content-type"] || "application/json",
-        Authorization: req.headers["authorization"] || "",
-      },
+      headers: proxyHeaders, // Use the cleaned and fixed headers
     },
     (proxyRes) => {
-      let data = "";
-      proxyRes.on("data", (chunk) => (data += chunk));
-      proxyRes.on("end", () => {
-        res.writeHead(proxyRes.statusCode || 200, {
-          "Content-Type":
-            proxyRes.headers["content-type"] || "application/json",
-        });
-        res.end(data);
-      });
+      // --- 5. Forward Response ---
+      // Forward the status code and all headers from the target API
+      const responseHeaders = {
+        ...proxyRes.headers,
+        "Access-Control-Allow-Origin": "*", // Re-apply CORS headers
+      };
+      // Remove any transfer-encoding: chunked header if present
+      delete responseHeaders['transfer-encoding']; 
+      
+      res.writeHead(proxyRes.statusCode || 200, responseHeaders);
+      
+      // Stream the response body from the target API back to the client
+      proxyRes.pipe(res);
     }
   );
+  
+  // Handle errors from the proxy request itself
+  proxyReq.on('error', (e) => {
+      console.error('Proxy Request Error:', e.message);
+      res.writeHead(500, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: `Proxy failed: ${e.message}` }));
+  });
 
-  // Forward POST body
-  req.on("data", (chunk) => proxyReq.write(chunk));
-  req.on("end", () => proxyReq.end());
+  // --- 6. Forward Request Body (Piping for robustness) ---
+  // Pipe the incoming request stream directly to the proxy request stream
+  req.pipe(proxyReq);
+
+  // Note: req.pipe(proxyReq) handles both the data and the end events correctly.
 });
 
 server.listen(PORT, () => console.log("CORS proxy running on", PORT));
